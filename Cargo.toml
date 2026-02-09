@@ -1,7 +1,9 @@
 [package]
 name = "http-server-rust"
 version = "0.1.0"
+authors = ["Rojan Rana Magar <rozenmagar058@gmail.com>"]
 edition = "2024"
+rust-version = "1.93.0"
 
 [dependencies]
 anyhow = "1.0.101"
