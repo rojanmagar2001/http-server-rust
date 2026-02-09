@@ -46,37 +46,28 @@ struct Request {
 fn read_header_line(stream: &TcpStream) -> io::Result<String> {
     let mut buf = Vec::with_capacity(0x1000);
 
-    match stream.bytes().next() {
-        Some(Ok(byte)) => {
-            if byte == b'\n' {
-                let header_line = String::from_utf8(buf).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Not an HTTP header")
-                })?;
-                return Ok(header_line);
-            }
+    while let Some(Ok(byte)) = stream.bytes().next() {
+        if byte == b'\n' {
+            let header_line = String::from_utf8(buf)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Not an HTTP header"))?;
+            return Ok(header_line);
+        }
 
-            buf.push(byte);
-        }
-        Some(Err(err)) => return Err(err),
-        None => {
-            let ioerr = io::Error::new(io::ErrorKind::ConnectionAborted, "client aborted early");
-            return Err(ioerr);
-        }
+        buf.push(byte);
     }
 
-    todo!()
+    Err(io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "client aborted early",
+    ))
 }
 
 impl Request {
     fn new(stream: TcpStream) -> io::Result<Request> {
-        let mut buf = Vec::with_capacity(0x1000);
-        match stream.read(&mut buf) {
-            Ok(_num_bytes_read) => {
-                let req_str = String::from_utf8_lossy(&buf);
-                println!("{}", req_str);
-            }
-            Err(err) => println!("Unable to read stream: {}", e),
-        }
+        // GET / HTTP/1.1
+        let http_metadata = read_header_line(&stream)?;
+
+        todo!()
     }
 }
 
