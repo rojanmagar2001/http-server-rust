@@ -49,7 +49,7 @@ fn main() -> Result<()> {
                             debug!("root path requested");
                             stream.write(SUCCESS_RESPONSE)?;
                             stream.flush()?;
-                        } else if path.starts_with("/user-agent/") {
+                        } else if path.starts_with("/user-agent") {
                             let mut user_agent = None;
                             for (key, value) in headers {
                                 if key == "User-Agent" {
