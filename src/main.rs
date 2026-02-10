@@ -30,9 +30,30 @@ fn main() -> Result<()> {
                         if path == "/" {
                             debug!("root path requested");
                             stream.write(SUCCESS_RESPONSE)?;
+                            stream.flush()?;
+                        } else if path.starts_with("/echo") {
+                            let echo_path = path.split_once("/echo/");
+                            match echo_path {
+                                Some((_, path)) => {
+                                    debug!("echo path requested: {path}");
+                                    let response = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+                                        path.len(),
+                                        path
+                                    );
+                                    stream.write(response.as_bytes())?;
+                                    stream.flush()?;
+                                }
+                                _ => {
+                                    error!(
+                                        "Invalid echo path in request. Request: `{request_line}`"
+                                    )
+                                }
+                            }
                         } else {
                             debug!("unknown path: {path}");
                             stream.write(ERROR_RESPONSE)?;
+                            stream.flush()?;
                         }
                     }
                     _ => {
