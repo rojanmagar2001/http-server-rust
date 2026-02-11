@@ -8,30 +8,50 @@ use log::{debug, error};
 use tokio::{
     fs,
     io::{self, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
 };
 
 use crate::{request::Request, response::Response};
 
-/// Top-level request dispatcher: parses the request and routes to the appropriate handler.
+/// Top-level connection handler: loops to serve multiple requests on a
+/// persistent HTTP/1.1 connection.
 pub async fn handle_request(stream: TcpStream, files_dir: Arc<PathBuf>) -> Result<()> {
     debug!("accepted new connection");
 
-    let (request, mut stream) = Request::from_stream(stream)
-        .await
-        .context("parsing request")?;
+    let peer_addr = stream.peer_addr().ok();
+    let mut reader = tokio::io::BufReader::new(stream);
 
-    debug!(
-        "{} {} from {:?}",
-        request.method, request.path, request.peer_addr
-    );
+    loop {
+        // Parse the next request — None means clean EOF (client closed)
+        let request = match Request::from_reader(&mut reader, peer_addr).await? {
+            Some(req) => req,
+            None => {
+                debug!("client closed connection");
+                break;
+            }
+        };
 
-    let response = route(&request, &files_dir, &mut stream).await?;
+        debug!(
+            "{} {} from {:?}",
+            request.method, request.path, request.peer_addr
+        );
 
-    if let Some(resp) = response {
-        resp.write_to(&mut stream)
-            .await
-            .context("writing response")?;
+        // Check whether the client wants to close after this request
+        let should_close = request
+            .header_value("Connection")
+            .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+
+        let stream = reader.get_mut();
+        let response = route(&request, &files_dir, stream).await?;
+
+        if let Some(resp) = response {
+            resp.write_to(stream).await.context("writing response")?;
+        }
+
+        if should_close {
+            debug!("closing connection (Connection: close)");
+            break;
+        }
     }
 
     Ok(())
@@ -165,6 +185,22 @@ fn is_valid_single_filename(name: &str) -> bool {
     let is_single = components.next().is_none();
 
     is_normal && is_single
+}
+
+/// Spin up a server that handles a full persistent connection
+/// (multiple requests on the same TCP stream), then returns the
+/// address to connect to.
+async fn persistent_server(files_dir: PathBuf) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = Arc::new(files_dir);
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        handle_request(stream, dir).await.unwrap();
+    });
+
+    addr
 }
 
 #[cfg(test)]
@@ -600,5 +636,121 @@ mod tests {
         let text = String::from_utf8(resp).unwrap();
 
         assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
+    }
+
+    // ── Integration: persistent connections ──────────────────────────
+
+    #[tokio::test]
+    async fn test_persistent_two_requests_same_connection() {
+        let addr = persistent_server(PathBuf::from("/tmp")).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // First request: GET /echo/banana
+        client
+            .write_all(b"GET /echo/banana HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let resp1 = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"), "resp1: {}", resp1);
+        assert!(resp1.contains("banana"), "resp1 body missing: {}", resp1);
+
+        // Second request on the same connection: GET /echo/apple
+        client
+            .write_all(b"GET /echo/apple HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+
+        let n = client.read(&mut buf).await.unwrap();
+        let resp2 = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"), "resp2: {}", resp2);
+        assert!(resp2.contains("apple"), "resp2 body missing: {}", resp2);
+
+        // Close the connection
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_persistent_echo_then_user_agent() {
+        let addr = persistent_server(PathBuf::from("/tmp")).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // First request: GET /echo/banana
+        client
+            .write_all(b"GET /echo/banana HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        let resp1 = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"), "resp1: {}", resp1);
+        assert!(resp1.contains("banana"), "resp1 body missing: {}", resp1);
+
+        // Second request: GET /user-agent
+        client
+            .write_all(
+                b"GET /user-agent HTTP/1.1\r\nHost: test\r\nUser-Agent: blueberry/apple\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let n = client.read(&mut buf).await.unwrap();
+        let resp2 = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"), "resp2: {}", resp2);
+        assert!(
+            resp2.contains("blueberry/apple"),
+            "resp2 body missing: {}",
+            resp2
+        );
+
+        client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_persistent_connection_close_header() {
+        let addr = persistent_server(PathBuf::from("/tmp")).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Send a request with Connection: close
+        client
+            .write_all(b"GET /echo/done HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Read the response
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf);
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp: {}", resp);
+        assert!(resp.contains("done"), "resp body missing: {}", resp);
+
+        // The server should have closed its side, so read_to_end returned.
+        // (If the server didn't close, read_to_end would hang.)
+    }
+
+    #[tokio::test]
+    async fn test_persistent_client_closes_after_first_request() {
+        let addr = persistent_server(PathBuf::from("/tmp")).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // Send one request, then close
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+
+        // Close the client side — the server loop should exit cleanly
+        client.shutdown().await.unwrap();
     }
 }

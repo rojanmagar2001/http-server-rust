@@ -28,15 +28,35 @@ fn trim_line_ending(s: &str) -> &str {
 impl Request {
     /// Asynchronously parse a Request from a TcpStream.
     /// Returns the parsed Request and the original TcpStream back (ready for writing).
+    ///
+    /// This is a convenience wrapper around [`from_reader`] for one-shot usage.
     pub async fn from_stream(stream: TcpStream) -> Result<(Self, TcpStream)> {
         let peer_addr = stream.peer_addr().ok();
         let mut reader = BufReader::new(stream);
 
-        // Read and parse the request line
-        let (method, path, http_version) = Self::read_request_line(&mut reader).await?;
+        match Self::from_reader(&mut reader, peer_addr).await? {
+            Some(req) => Ok((req, reader.into_inner())),
+            None => bail!("connection closed before request line"),
+        }
+    }
+
+    /// Parse the next HTTP request from an existing `BufReader`.
+    ///
+    /// Returns `Ok(None)` when the connection is closed cleanly (EOF before the
+    /// request line), `Ok(Some(request))` on success, or `Err(...)` on a parse
+    /// error.  This signature allows callers to loop over a persistent connection.
+    pub async fn from_reader(
+        reader: &mut BufReader<TcpStream>,
+        peer_addr: Option<SocketAddr>,
+    ) -> Result<Option<Self>> {
+        // Read and parse the request line — None means clean EOF
+        let (method, path, http_version) = match Self::read_request_line(reader).await? {
+            Some(parts) => parts,
+            None => return Ok(None),
+        };
 
         // Read headers
-        let headers = Self::read_headers(&mut reader).await?;
+        let headers = Self::read_headers(reader).await?;
 
         // Build a partial request so we can use header_value() for Content-Length
         let mut request = Self {
@@ -64,28 +84,31 @@ impl Request {
             request.body = Some(buf);
         }
 
-        let stream = reader.into_inner();
-        Ok((request, stream))
+        Ok(Some(request))
     }
 
     /// Read and parse the HTTP request line (e.g. "GET / HTTP/1.1").
+    ///
+    /// Returns `Ok(None)` on clean EOF (0 bytes read).
     async fn read_request_line(
         reader: &mut BufReader<TcpStream>,
-    ) -> Result<(String, String, String)> {
+    ) -> Result<Option<(String, String, String)>> {
         let mut line = String::new();
         let n = reader
             .read_line(&mut line)
             .await
             .context("reading request line")?;
         if n == 0 {
-            bail!("connection closed before request line");
+            return Ok(None); // clean EOF
         }
 
         let trimmed = trim_line_ending(&line);
         match trimmed.split_whitespace().collect::<Vec<_>>().as_slice() {
-            [method, path, version] => {
-                Ok((method.to_string(), path.to_string(), version.to_string()))
-            }
+            [method, path, version] => Ok(Some((
+                method.to_string(),
+                path.to_string(),
+                version.to_string(),
+            ))),
             _ => bail!("invalid request line: {}", trimmed),
         }
     }
