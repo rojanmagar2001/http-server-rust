@@ -43,6 +43,11 @@ impl Response {
         r
     }
 
+    /// Convenience: 201 Created with no body.
+    pub fn created() -> Self {
+        Self::status_only(201, "Created")
+    }
+
     /// Construct a "status only" response that will be written exactly as:
     /// `HTTP/1.1 {status} {reason}\r\n\r\n`
     pub fn status_only(status_code: u16, reason: &str) -> Self {
@@ -467,5 +472,13 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.contains("Content-Type: application/octet-stream\r\n"));
         assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_created() {
+        let r = Response::created();
+        let raw = String::from_utf8(r.build_raw()).unwrap();
+        // Exact format: status line + CRLF CRLF, no headers, no body
+        assert_eq!(raw, "HTTP/1.1 201 Created\r\n\r\n");
     }
 }

@@ -53,7 +53,7 @@ async fn route(
     } else if request.path.starts_with("/user-agent") {
         Ok(Some(handle_user_agent(request)))
     } else if let Some(filename) = request.path.strip_prefix("/files/") {
-        handle_files(filename, files_dir, stream).await
+        handle_files(filename, files_dir, stream, request).await
     } else {
         debug!("unknown path: {}", request.path);
         Ok(Some(Response::not_found()))
@@ -93,6 +93,7 @@ async fn handle_files(
     filename: &str,
     files_dir: &Path,
     stream: &mut TcpStream,
+    request: &Request,
 ) -> Result<Option<Response>> {
     if !is_valid_single_filename(filename) {
         return Ok(Some(Response::not_found()));
@@ -100,6 +101,18 @@ async fn handle_files(
 
     let file_path = files_dir.join(filename);
 
+    match request.method.as_str() {
+        "GET" => handle_file_get(&file_path, filename, stream).await,
+        "POST" => handle_file_post(&file_path, request).await,
+        _ => Ok(Some(Response::not_found())),
+    }
+}
+
+async fn handle_file_get(
+    file_path: &Path,
+    filename: &str,
+    stream: &mut TcpStream,
+) -> Result<Option<Response>> {
     let meta = match fs::metadata(&file_path).await {
         Ok(m) if m.is_file() => m,
         _ => return Ok(Some(Response::not_found())),
@@ -123,6 +136,19 @@ async fn handle_files(
     debug!("streamed {} bytes for file {}", bytes_copied, filename);
 
     Ok(None)
+}
+
+/// POST /files/{filename} — create/overwrite a file with the request body.
+async fn handle_file_post(file_path: &Path, request: &Request) -> Result<Option<Response>> {
+    let body = request.body.as_deref().unwrap_or_default();
+
+    fs::write(file_path, body)
+        .await
+        .context("writing file to disk")?;
+
+    debug!("created file {:?} ({} bytes)", file_path, body.len());
+
+    Ok(Some(Response::created()))
 }
 
 // ---------------------------------------------------------------------------
@@ -480,5 +506,99 @@ mod tests {
         let body = &resp[pos + header_end.len()..];
 
         assert_eq!(body, &binary);
+    }
+
+    // ── Integration: POST /files ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_integration_post_file_creates_file() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let addr = one_shot_server(tmp.path().to_path_buf()).await;
+        let body = b"hello file content";
+        let req = format!(
+            "POST /files/newfile.txt HTTP/1.1\r\n\
+             Host: test\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            std::str::from_utf8(body).unwrap(),
+        );
+        let resp = send_raw_request(addr, req.as_bytes()).await;
+        let text = String::from_utf8(resp).unwrap();
+
+        assert!(
+            text.starts_with("HTTP/1.1 201 Created\r\n"),
+            "expected 201, got: {}",
+            text
+        );
+
+        // Verify the file was actually created with correct content
+        let written = std::fs::read(tmp.path().join("newfile.txt")).unwrap();
+        assert_eq!(written, body);
+    }
+
+    #[tokio::test]
+    async fn test_integration_post_file_overwrites_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("existing.txt"), b"old content").unwrap();
+
+        let addr = one_shot_server(tmp.path().to_path_buf()).await;
+        let body = b"new content";
+        let req = format!(
+            "POST /files/existing.txt HTTP/1.1\r\n\
+             Host: test\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Length: {}\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            std::str::from_utf8(body).unwrap(),
+        );
+        let resp = send_raw_request(addr, req.as_bytes()).await;
+        let text = String::from_utf8(resp).unwrap();
+
+        assert!(text.starts_with("HTTP/1.1 201 Created\r\n"));
+
+        let written = std::fs::read(tmp.path().join("existing.txt")).unwrap();
+        assert_eq!(written, body);
+    }
+
+    #[tokio::test]
+    async fn test_integration_post_file_empty_body() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let addr = one_shot_server(tmp.path().to_path_buf()).await;
+        let req = b"POST /files/empty.txt HTTP/1.1\r\n\
+                     Host: test\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Content-Length: 0\r\n\
+                     \r\n";
+        let resp = send_raw_request(addr, req).await;
+        let text = String::from_utf8(resp).unwrap();
+
+        assert!(text.starts_with("HTTP/1.1 201 Created\r\n"));
+
+        let written = std::fs::read(tmp.path().join("empty.txt")).unwrap();
+        assert!(written.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_integration_post_file_traversal_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let addr = one_shot_server(tmp.path().to_path_buf()).await;
+        let req = b"POST /files/../evil.txt HTTP/1.1\r\n\
+                     Host: test\r\n\
+                     Content-Type: application/octet-stream\r\n\
+                     Content-Length: 4\r\n\
+                     \r\n\
+                     evil";
+        let resp = send_raw_request(addr, req).await;
+        let text = String::from_utf8(resp).unwrap();
+
+        assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
     }
 }
